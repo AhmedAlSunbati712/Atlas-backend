@@ -16,6 +16,18 @@ const createDocument = async (req: Request & { userId: string }, res: Response) 
     }
 }
 
+const getDocumentById = async (req: Request & { userId: string }, res: Response) => {
+    try {
+        if (!req.userId) {
+            return res.status(401).json({ error: "Unauthorized" });
+        }
+        const document = await documentService.getDocuments({ id: req.params.id as string }, req.userId);
+        res.status(200).json(document);
+    } catch (error) {
+        console.error("Error getting document by id:", error);
+        res.status(500).json({ error: "Failed to get document by id" });
+    }
+}
 
 const getDocuments = async (req: Request & { userId: string }, res: Response) => {
     try {
@@ -48,6 +60,7 @@ const documentController = {
     createDocument,
     getDocuments,
     getUserDocuments,
+    getDocumentById,
 }
 
 export default documentController;
