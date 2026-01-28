@@ -2,6 +2,8 @@
 
 This document reasons from the [product specification](README.md) to a concrete backend architecture: required components, their responsibilities, and a recommended tech stack.
 
+**Stack choices (locked in):** **Node.js**, **PostgreSQL**, **S3** (or S3-compatible object storage). See **§4** (tech stack), **§7** (Vector DB), **§8** (WebSockets), and **§9** (next steps).
+
 ---
 
 ## 1. Architecture rationale
@@ -170,59 +172,51 @@ Storing **documents** in object storage and **metadata + annotations** in a rela
 
 ## 4. Recommended tech stack
 
-Recommendations are chosen for clarity, ecosystem fit, and the ability to start as a single deployable app and split later.
+**Locked in:** **Node.js** (LTS), **PostgreSQL**, **S3** (or S3-compatible). The rest is chosen to fit that base and keep the MVP as one deployable app.
 
 ### 4.1 Runtime and API
 
-- **Runtime**: **Node.js** (LTS) or **Python 3.11+**.
-- **API**: **Fastify** (Node) or **FastAPI** (Python).
-  - Both are fast, support async I/O, OpenAPI, and WebSockets. Fastify fits a TypeScript backend; FastAPI fits heavy use of Python ML/embeddings in the same repo.
-
-**Recommendation**: Prefer **Node.js + TypeScript + Fastify** if the frontend is TypeScript and the team prefers one language end-to-end; prefer **Python + FastAPI** if more logic will live in Python (e.g. embedding and AI code in the same codebase).
+- **Runtime**: **Node.js** (LTS) with **TypeScript**.
+- **API**: **Fastify** — async, low latency, built-in schema validation, WebSocket support, and good OpenAPI story.
 
 ### 4.2 Auth
 
-- **Strategy**: JWT access tokens + optional refresh tokens; or OAuth2/OIDC with an identity provider.
-- **Libraries**: **Passport.js** + **jsonwebtoken** (Node), or **python-jose** / **Authlib** (Python). Alternatively, **Supabase Auth** or **Clerk** for less custom code.
-- **RBAC**: Implement in app logic and middleware using roles and resource ownership stored in the DB.
+- **Strategy**: JWT access tokens + optional refresh tokens; or OAuth2/OIDC via an identity provider.
+- **Libraries**: **Passport.js** + **jsonwebtoken**, or **Supabase Auth** / **Clerk** if you want to avoid custom auth code.
+- **RBAC**: Implement in app logic and middleware; roles and resource ownership live in PostgreSQL.
 
 ### 4.3 Databases and storage
 
 - **Relational**: **PostgreSQL 15+**  
-  - Metadata, users, annotations, threads, links.  
-  - Use **pg_trgm** and full-text search (tsvector/tsquery) for MVP search.  
-  - **pgvector** can be used for a single-DB MVP with vectors, or a dedicated vector DB can be introduced when scaling.
+  - Users, documents metadata, annotations, threads, links.  
+  - Use **pg_trgm** and built-in full-text search (tsvector/tsquery) for MVP search.
 
-- **Object storage**: **S3-compatible** (AWS S3, **MinIO** for local/dev, Cloudflare R2 for cost).  
-  - Documents and, if needed, preview assets.
+- **Object storage**: **S3** or S3-compatible (**AWS S3**, **MinIO** for local/dev, **Cloudflare R2**).  
+  - Document blobs (PDFs, images) and optionally preview assets.
 
-- **Vector DB** (when semantic search is in scope): **pgvector** (simplest), or **Weaviate** / **Qdrant** / **Pinecone** for scale.  
-  - MVP can start with pgvector or skip vectors.
+- **Vector DB**: See **§7** for recommendation and rationale.
 
 ### 4.4 Real-time and jobs
 
-- **Pub/sub and queues**: **Redis**  
-  - Pub/sub for collaboration events across API instances.  
-  - Queues: **BullMQ** (Node) or **Celery** (Python) for ingestion, embeddings, and AI jobs.
-
-- **WebSockets**: **ws** or **socket.io** (Node), or **FastAPI WebSockets** (Python), with Redis adapter when scaling to multiple nodes.
+- **Pub/sub and queues**: **Redis** — pub/sub for collaboration, **BullMQ** for job queues (ingestion, embeddings, AI).
+- **WebSockets**: **@fastify/websocket** or **socket.io** with a Redis adapter when you run more than one API instance. See **§8** for why they’re needed and how they plug into the flow.
 
 ### 4.5 Search
 
 - **MVP**: **PostgreSQL** full-text + **pg_trgm** for fuzzy match.  
-- **Later**: **Meilisearch** or **Typesense** for better UX, or **Elasticsearch** if you need rich query DSL and existing Elastic skills.
+- **Later**: **Meilisearch** or **Typesense** for better search UX if needed.
 
 ### 4.6 AI
 
 - **LLM**: HTTP client to **OpenAI**, **Anthropic**, or compatible APIs.  
-- **Embeddings**: Same providers or **sentence-transformers** (Python) if you want to run embeddings on your own hardware.  
-- **Orchestration**: Worker jobs that load context (annotations, doc chunks), call the API, then write results and citations as annotations.
+- **Embeddings**: Same providers (OpenAI/Anthropic embeddings APIs) from Node workers.  
+- **Orchestration**: BullMQ jobs that load context (annotations, doc chunks), call the LLM/embeddings API, then write results and citations as annotations.
 
 ### 4.7 Observability and ops
 
-- **Logging**: Structured JSON logs (e.g. **pino** in Node, **structlog** in Python).
-- **Metrics**: **OpenTelemetry** or app-level metrics (e.g. **prom-client** / **Prometheus**) for latency and queue depth.
-- **Deployment**: Single process for API + in-process “services” for MVP; workers as separate processes or containers. **Docker** (and optional **docker-compose**) for local and CI.
+- **Logging**: Structured JSON (e.g. **pino**).
+- **Metrics**: **OpenTelemetry** or **prom-client** for latency and queue depth.
+- **Deployment**: One API process + one worker process for MVP; **Docker** (and **docker-compose**) for local and CI.
 
 ---
 
@@ -251,3 +245,70 @@ For the MVP (auth, PDF upload/view, highlights + threaded comments, personal + g
 - **One worker process** running ingestion + AI jobs (and later embedding jobs when you add semantic search).
 
 This keeps operations simple while preserving clear boundaries so you can extract services or add new workers as the product grows.
+
+---
+
+## 7. Vector DB: what to use and why
+
+**Recommendation for this stack: pgvector (PostgreSQL extension).**
+
+| Option | Pros | Cons |
+|--------|------|------|
+| **pgvector** | Same DB as everything else; no new service; ACID; good Node support (`pgvector` npm). Adequate for “related annotations” and MVP semantic search. | Vector search scale and latency can lag dedicated vector DBs at very high dimensions or millions of rows. |
+| **Pinecone** | Managed, great DX, strong Node SDK. | Extra service and cost; another moving part for MVP. |
+| **Weaviate / Qdrant** | Open source, scalable, built for vectors. | New deployment and ops; more useful once you’re beyond single-DB limits. |
+
+**Why you need a vector store at all:** The spec calls for *semantic search* and *suggested related annotations/documents*. That means comparing *embeddings* (vectors), not just keywords. A vector DB (or PostgreSQL with pgvector) does approximate nearest-neighbour search over those vectors.
+
+**Practical path:** Use **pgvector** in your existing PostgreSQL instance for the MVP. Enable the extension, add an `embeddings` table (or columns) keyed by document/annotation id, and run embedding jobs that write into it. If you outgrow it (e.g. very large corpus or strict latency SLA), introduce Pinecone, Weaviate, or Qdrant and point the embedding pipeline and search API there.
+
+---
+
+## 8. WebSockets: why they’re needed and how they fit in
+
+**Why WebSockets:** The spec requires *real-time updates for annotations* and *&lt;200ms propagation*. When user A creates or edits an annotation, everyone else viewing that document should see it almost immediately. Polling over HTTP would be slow and wasteful; you need the server to *push* events to connected clients. WebSockets (or SSE) provide a long-lived channel for that.
+
+**How they integrate with the rest of the flow:**
+
+1. **Client** opens a WebSocket to the backend and sends a “join” message with `documentId` (and optionally `layer`). The server treats this as joining a *room* for that document/layer.
+2. **Annotation CRUD stays on HTTP.** The client creates/updates/deletes annotations via normal REST (e.g. `POST /documents/:id/annotations`). The API validates auth, writes to PostgreSQL, returns 201 + body.
+3. **Publish after write.** Right after a successful write, the same API process publishes an event to Redis (e.g. channel `doc:${documentId}`) with payload like `{ type: 'annotation.created', annotation }`.
+4. **WebSocket server subscribes to Redis.** The collaboration / WebSocket layer subscribes to those Redis channels. When it receives an event, it pushes the same payload to every WebSocket client in the matching room.
+5. **Clients** receive the event over the socket and update local state (e.g. add/update the annotation in the UI). No need to poll.
+
+So: **HTTP for all state changes** (single source of truth, easy to reason about); **WebSockets for broadcasting** those changes to other viewers. Auth is done once at WebSocket upgrade (e.g. via token in query or first message); room membership is enforced so users only get events for documents they’re allowed to see.
+
+**Multi-instance:** When you run more than one API server, each one subscribes to the same Redis channels. Every instance gets every event and can forward it to its own connected clients, so you get a single logical “bus” for real-time updates without tying clients to a specific server.
+
+---
+
+## 9. Next steps / what to start with
+
+Ordered so each step gives you something runnable and the next builds on it.
+
+1. **Scaffold the backend**  
+   - Node + TypeScript + Fastify, folder layout (`src/routes`, `src/services`, `src/db`), env config (`DATABASE_URL`, `S3_*`, etc.), `npm run dev` and a health route.
+
+2. **PostgreSQL + schema**  
+   - Create DB, add migrations (e.g. with **Drizzle** or **Prisma**). Start with tables: `users`, `documents` (metadata only), `annotations`. Get the app connecting and performing a simple read.
+
+3. **Auth**  
+   - Sign-up / login (e.g. email + password), issue JWT. Middleware that validates the token and attaches `user` to the request. Optionally plug in Supabase or Clerk to save implementation time.
+
+4. **Document service**  
+   - Wire S3 (or MinIO locally). Implement upload (presigned or server-side), store document metadata in `documents`, and an endpoint to get a download/preview URL. No viewer logic yet.
+
+5. **Annotation service**  
+   - CRUD for annotations scoped to a document and user; support at least highlight and comment, plus layers (e.g. `personal` / `group`). This is the core of the product.
+
+6. **Real-time (WebSockets + Redis)**  
+   - Add Redis, WebSocket endpoint, and “join document room” semantics. On each annotation create/update/delete, publish to Redis and push to clients in that room. Verify updates appear in a second browser/tab without refresh.
+
+7. **Search**  
+   - PostgreSQL full-text on documents and annotations, plus basic filters (by user, layer, doc). Expose via a `GET /search` (or similar) endpoint.
+
+8. **Workers + AI**  
+   - BullMQ queue, worker process, and one job type (e.g. “summarize selection”). Worker calls the LLM, then writes the result as an annotation and links it to the source. Ensure failures don’t break annotation persistence.
+
+9. **Vector DB + semantic search (later)**  
+   - Enable pgvector, add embedding storage, run embedding jobs from ingestion or annotation changes. Add a “semantic search” or “related annotations” API that queries by vector. This can follow once the above is stable.
