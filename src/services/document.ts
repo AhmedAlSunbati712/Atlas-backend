@@ -1,6 +1,5 @@
 import { prisma } from "../db/client";
-import type { Document, DocumentMember, Annotation, DocumentType } from "@prisma/client";
-import { getPresignedUploadUrl, getPresignedDownloadUrl } from "../utils/s3";
+import type { Document, DocumentType } from "@prisma/client";
 
 interface CreateDocumentInput {
     ownerId: string;
@@ -23,11 +22,18 @@ const createDocument = async (data: CreateDocumentInput): Promise<Document> => {
     }
 }
 
-const getDocuments = async (query: Partial<Document>): Promise<Document[]> => {
+const getDocuments = async (query: Partial<Document>, userId?: string): Promise<Document[]> => {
     try {
         const documents = await prisma.document.findMany({
             where: {
                 ...query,
+                OR: [
+                    { ownerId: userId},
+                    { members: { some: { userId } } },
+                ],
+            },
+            include: {
+                members: true,
             }
         });
         return documents;
@@ -41,9 +47,15 @@ const getUserDocuments = async (userId: string): Promise<Document[]> => {
     try {
         const documents = await prisma.document.findMany({
             where: {
-                ownerId: userId,
+                OR: [
+                    { ownerId: userId},
+                    { members: { some: { userId } } },
+                ]
+            },
+            include: {
+                members: true,
             }
-        })
+        });
         return documents;
     } catch (error) {
         console.error("Error getting user documents:", error);

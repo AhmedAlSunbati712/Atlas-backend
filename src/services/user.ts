@@ -1,5 +1,5 @@
 import { prisma } from "../db/client";
-import { hashPassword, verifyPassword, generateAccessToken } from "../utils/auth";
+import { hashPassword } from "../utils/auth";
 import type { User } from "@prisma/client";
 
 export interface CreateUserInput {
