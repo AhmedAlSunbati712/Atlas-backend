@@ -1,314 +1,443 @@
 # Atlas Backend — Architecture
 
-This document reasons from the [product specification](README.md) to a concrete backend architecture: required components, their responsibilities, and a recommended tech stack.
-
-**Stack choices (locked in):** **Node.js**, **PostgreSQL**, **S3** (or S3-compatible object storage). See **§4** (tech stack), **§7** (Vector DB), **§8** (WebSockets), and **§9** (next steps).
+This document describes the finalized architecture for the Atlas collaborative annotation platform.
 
 ---
 
-## 1. Architecture rationale
+## 1. System Overview
 
-### 1.1 From requirements to subsystems
-
-The spec defines six main functional areas and strong non-functional constraints. Each area implies one or more backend components:
-
-| Requirement area | Why it needs dedicated components |
-|------------------|-----------------------------------|
-| **Document management** | Uploads, versioning, and previews are I/O-heavy and need isolation from low-latency paths. Storing blobs (PDFs, images) is a different concern from metadata and permissions. |
-| **Annotations** | Annotations are the core domain object: create/update/delete, anchoring, threads, reactions. They must be fast (<200ms), durable (“never lost”), and queryable by document, layer, and user. |
-| **Collaboration** | Real-time propagation and presence need a stateful, connection-oriented layer (e.g. WebSockets) and possibly a pub/sub layer so multiple app instances can share events. |
-| **Search & discovery** | Full-text over documents and annotations plus semantic search over embeddings require both keyword search and vector search, which map to different storage and indexing systems. |
-| **Cross-document linking** | Links form a graph. Graph traversal (e.g. “annotations related to this one”) and graph visualization endpoints are easier to implement if the model and queries are explicit rather than buried in general CRUD. |
-| **AI-assisted reading** | Summaries, explanations, and suggestions are CPU/API-heavy and async. They must not block core reads/writes. Failures must not affect annotation persistence. So AI runs in a separate async layer with queues and workers. |
-
-The spec’s “Backend Services” list (auth, document, annotation, collaboration, search & graph) and “Async / AI Layer” (ingestion, embeddings, AI workers) align with this breakdown. The architecture keeps these as **logical components** that can be implemented as modules or services inside one process for the MVP, and split into separate services later if needed.
-
-### 1.2 Data flow and boundaries
-
-- **Synchronous path**: API → Auth → Document/Annotation/Collaboration/Search services → PostgreSQL (and object storage for document bytes). Optimized for latency and consistency.
-- **Async path**: Upload/event triggers → Queue → Workers (ingestion, embeddings, AI) → Object storage, vector DB, and annotation store. Optimized for throughput and fault tolerance.
-- **Real-time path**: Client ↔ WebSocket/SSE → collaboration service ↔ pub/sub (e.g. Redis) so all API instances see the same presence and annotation events.
-
-Storing **documents** in object storage and **metadata + annotations** in a relational DB keeps blob handling separate from transactional, queryable data. **Embeddings** live in a vector store so semantic search stays scalable and doesn’t overload the main DB.
-
----
-
-## 2. Components
-
-### 2.1 Auth & permissions service
-
-**Responsibilities**
-
-- User identity (sign-up, login, sessions or tokens).
-- Role-based access (e.g. viewer, commenter, owner) and enforcing who can read/write which documents and layers.
-- Token/session validation for other backend components.
-
-**Needs**
-
-- User store (or integration with IdP).
-- Permission checks on every document and annotation access.
-
-**MVP**: Single component; can be a library or module used by the API rather than a separate microservice.
-
----
-
-### 2.2 Document service
-
-**Responsibilities**
-
-- Accept uploads (PDF, text, code, images).
-- Store files in object storage and metadata (owner, type, permissions, versions) in the DB.
-- Serve document metadata and pre-signed or proxied URLs for download/preview.
-- Optional: trigger ingestion (e.g. text extraction, page splits) for search and anchoring.
-
-**Needs**
-
-- Object storage (S3-compatible or similar).
-- Relational store for document and version metadata.
-- Idempotent handling of versions.
-
-**MVP**: Upload, store, version metadata, and serve URLs; minimal preview generation if any.
-
----
-
-### 2.3 Annotation service
-
-**Responsibilities**
-
-- CRUD for annotations (highlight, comment, inline note, link, tag).
-- Threaded discussions, reactions, resolve/reopen.
-- Anchoring: text (offset + context), code (file + line range), image (bounding box).
-- Layer (personal / group / public) and visibility rules.
-- Persistence and consistency so annotations are “never lost.”
-
-**Needs**
-
-- Relational DB with support for JSON (anchor payloads, metadata).
-- Clear schema for annotations, threads, and links.
-- Authorization integrated with the auth & permissions service.
-
-**MVP**: Highlights, threaded comments, personal + group layers, and stable anchors for at least text/PDF.
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                              Atlas Backend                                  │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│   ┌─────────────────────────────────────────────────────────────────────┐   │
+│   │                         Express API Server                          │   │
+│   │  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐            │   │
+│   │  │   Auth   │  │ Document │  │  Upload  │  │Annotation│            │   │
+│   │  │  Routes  │  │  Routes  │  │  Routes  │  │  Routes  │            │   │
+│   │  └────┬─────┘  └────┬─────┘  └────┬─────┘  └────┬─────┘            │   │
+│   │       │             │             │             │                   │   │
+│   │       ▼             ▼             ▼             ▼                   │   │
+│   │  ┌──────────────────────────────────────────────────────┐          │   │
+│   │  │                    Services Layer                     │          │   │
+│   │  └──────────────────────────────────────────────────────┘          │   │
+│   │       │                                          │                  │   │
+│   │       │  DB writes                    Queue jobs │                  │   │
+│   │       ▼                                          ▼                  │   │
+│   └───────┼──────────────────────────────────────────┼──────────────────┘   │
+│           │                                          │                      │
+│   ┌───────┼──────────────────────────────────────────┼──────────────────┐   │
+│   │       │           WebSocket Server               │                  │   │
+│   │       │  ┌─────────────────────────────────┐     │                  │   │
+│   │       │  │  Room Management + Presence     │     │                  │   │
+│   │       │  └─────────────────────────────────┘     │                  │   │
+│   │       │         │              ▲                 │                  │   │
+│   │       │         │   Subscribe  │  Publish        │                  │   │
+│   │       │         ▼              │                 │                  │   │
+│   └───────┼─────────┼──────────────┼─────────────────┼──────────────────┘   │
+│           │         │              │                 │                      │
+│           ▼         ▼              │                 ▼                      │
+│   ┌─────────────────────────────────────────────────────────────────────┐   │
+│   │                              Redis                                  │   │
+│   │  ┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐     │   │
+│   │  │  BullMQ Queues  │  │    Pub/Sub      │  │    Presence     │     │   │
+│   │  │  - doc-process  │  │  - doc:{id}     │  │  - room keys    │     │   │
+│   │  │  - embedding    │  │                 │  │    with TTL     │     │   │
+│   │  └─────────────────┘  └─────────────────┘  └─────────────────┘     │   │
+│   └───────────────────────────────────┬─────────────────────────────────┘   │
+│                                       │                                     │
+│   ┌───────────────────────────────────┼─────────────────────────────────┐   │
+│   │                            Workers │                                │   │
+│   │  ┌─────────────────┐  ┌───────────┴───────┐                        │   │
+│   │  │ Document Worker │  │ Embedding Worker  │                        │   │
+│   │  │ - Download S3   │  │ - Generate vectors│                        │   │
+│   │  │ - Extract text  │  │ - Store in DB     │                        │   │
+│   │  │ - Queue embed   │  │                   │                        │   │
+│   │  └────────┬────────┘  └─────────┬─────────┘                        │   │
+│   │           │                     │                                   │   │
+│   └───────────┼─────────────────────┼───────────────────────────────────┘   │
+│               │                     │                                       │
+│               ▼                     ▼                                       │
+│   ┌─────────────────────────────────────────────────────────────────────┐   │
+│   │                           PostgreSQL                                │   │
+│   │  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────────────┐    │   │
+│   │  │  users   │  │documents │  │annotations│  │ pgvector (embed) │    │   │
+│   │  └──────────┘  └──────────┘  └──────────┘  └──────────────────┘    │   │
+│   └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                             │
+│   ┌─────────────────────────────────────────────────────────────────────┐   │
+│   │                            S3 / MinIO                               │   │
+│   │                     (Document blob storage)                         │   │
+│   └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                             │
+│   ┌─────────────────────────────────────────────────────────────────────┐   │
+│   │                          External APIs                              │   │
+│   │                    (OpenAI Embeddings / LLM)                        │   │
+│   └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
 
 ---
 
-### 2.4 Collaboration service
+## 2. Tech Stack
 
-**Responsibilities**
-
-- Real-time delivery of annotation create/update/delete and presence.
-- Optional: activity feed, notifications (replies, mentions, links).
-- Target: annotation updates visible in &lt;200ms.
-
-**Needs**
-
-- WebSockets or SSE.
-- Pub/sub (e.g. Redis) so every API instance can publish and subscribe to room/channel-scoped events.
-- Room membership and presence state.
-
-**MVP**: Broadcast of annotation events per document or layer; presence optional. Last-write-wins is acceptable initially.
-
----
-
-### 2.5 Search & graph service
-
-**Responsibilities**
-
-- **Search**: Full-text over documents and annotations; filters by user, layer, tag, document; semantic search via embeddings.
-- **Graph**: Create and query links between annotations; relationship types; support for “related annotations” and graph visualization APIs.
-
-**Needs**
-
-- Full-text indexing (DB-native or dedicated engine).
-- Vector store and embedding pipeline for semantic search.
-- Graph model: links as first-class records; queries for paths, neighbourhoods, or suggested links.
-
-**MVP**: Full-text search and basic filters; semantic search and graph APIs can be limited or stubbed.
+| Layer | Technology |
+|-------|------------|
+| Runtime | Node.js (LTS) + TypeScript |
+| API Framework | Express |
+| Database | PostgreSQL 16 + pgvector extension |
+| ORM | Prisma |
+| Object Storage | S3 / MinIO (local dev) |
+| Cache + Queue + Pub/Sub | Redis (single instance) |
+| Job Queue | BullMQ |
+| WebSockets | express-ws or ws |
+| Auth | JWT (jsonwebtoken) |
+| Embeddings | OpenAI text-embedding-3-small |
+| PDF Parsing | pdf-parse or pdfjs-dist |
 
 ---
 
-### 2.6 Async / AI layer
+## 3. Components
 
-**Workers**
+### 3.1 Express API Server
 
-- **Ingestion**: Post-upload, extract text, split into pages/chunks, optional normalization for anchors.
-- **Embedding generation**: Turn text (documents, annotations) into vectors and write to the vector DB.
-- **AI agents**: Summarize, explain, suggest links, answer questions; write results as annotations and cite sources.
+The main HTTP server handling all REST endpoints.
 
-**Needs**
+| Module | Responsibility |
+|--------|----------------|
+| **Auth** | Sign-up, login, JWT issuance and validation |
+| **Upload** | Generate presigned S3 URLs for upload/download |
+| **Document** | CRUD for document metadata, permission checks |
+| **Annotation** | CRUD for annotations, threading, layers |
+| **Search** | Full-text and semantic search queries |
 
-- Job queue (e.g. Redis-based or cloud queue).
-- Worker processes that pull jobs and call external AI APIs.
-- Idempotency and retries so AI/embedding failures don’t corrupt data.
-- Feature flags or toggles so AI being down doesn’t block core reads/writes.
+### 3.2 WebSocket Server
 
-**MVP**: One worker type for “explain/summarize” and a simple queue; embeddings can be added right after.
+Handles real-time collaboration features.
 
----
+| Feature | How it works |
+|---------|--------------|
+| **Room management** | Clients join rooms by documentId; server tracks connections per room |
+| **Event broadcasting** | Subscribes to Redis pub/sub; forwards events to clients in matching rooms |
+| **Presence** | Tracks who is viewing each document; broadcasts cursor positions |
 
-### 2.7 API gateway / orchestration
+### 3.3 Redis
 
-**Responsibilities**
+Single Redis instance serving multiple purposes via namespacing:
 
-- Single entrypoint: REST or GraphQL.
-- Routing to auth, document, annotation, collaboration, search/graph.
-- Rate limiting, request validation, and centralized error handling.
+| Purpose | Redis Feature | Key Pattern |
+|---------|---------------|-------------|
+| Document processing queue | BullMQ | `bull:document-processing:*` |
+| Embedding generation queue | BullMQ | `bull:embedding:*` |
+| Real-time events | Pub/Sub | Channels: `doc:{documentId}` |
+| Presence tracking | Key-Value + TTL | `presence:{documentId}:{userId}` |
 
-**MVP**: One API application that composes the components above as modules or in-process calls. Collaboration can be exposed via a WebSocket endpoint on the same app or a shared pub/sub backend.
+### 3.4 Workers
 
----
+Separate Node.js processes that consume jobs from BullMQ queues.
 
-## 3. Storage layout
+| Worker | Responsibilities |
+|--------|------------------|
+| **Document Worker** | Download file from S3, extract text (PDF/OCR), update DB, queue embedding job |
+| **Embedding Worker** | Generate vector embeddings via OpenAI API, store in PostgreSQL (pgvector) |
 
-| Concern | Store | Rationale |
-|--------|--------|-----------|
-| Users, roles, sessions | Relational DB | ACID, joins with permissions and ownership. |
-| Documents metadata, versions | Relational DB | Versioning and permissions are relational. |
-| Document blobs (PDF, images) | Object storage | Large, append-only, stream-friendly; cheaper at scale. |
-| Annotations, threads, reactions, links | Relational DB | Strong consistency, relational queries, JSON for anchors. |
-| Full-text index | PostgreSQL FTS or search engine | Good enough for MVP with PostgreSQL; can move to Elasticsearch/Meilisearch later. |
-| Embeddings | Vector DB | Similarity search and scaling separate from transactional DB. |
+### 3.5 PostgreSQL
 
----
+Primary data store with pgvector extension for semantic search.
 
-## 4. Recommended tech stack
+| Table | Purpose |
+|-------|---------|
+| `users` | User accounts, auth |
+| `documents` | Document metadata, s3Key, textContent, processingStatus |
+| `document_members` | Many-to-many: which users have access to which documents |
+| `annotations` | Highlights, comments, notes, links, tags with hybrid anchors |
 
-**Locked in:** **Node.js** (LTS), **PostgreSQL**, **S3** (or S3-compatible). The rest is chosen to fit that base and keep the MVP as one deployable app.
+### 3.6 S3 / MinIO
 
-### 4.1 Runtime and API
+Object storage for document files (PDFs, images, code files).
 
-- **Runtime**: **Node.js** (LTS) with **TypeScript**.
-- **API**: **Fastify** — async, low latency, built-in schema validation, WebSocket support, and good OpenAPI story.
-
-### 4.2 Auth
-
-- **Strategy**: JWT access tokens + optional refresh tokens; or OAuth2/OIDC via an identity provider.
-- **Libraries**: **Passport.js** + **jsonwebtoken**, or **Supabase Auth** / **Clerk** if you want to avoid custom auth code.
-- **RBAC**: Implement in app logic and middleware; roles and resource ownership live in PostgreSQL.
-
-### 4.3 Databases and storage
-
-- **Relational**: **PostgreSQL 15+**  
-  - Users, documents metadata, annotations, threads, links.  
-  - Use **pg_trgm** and built-in full-text search (tsvector/tsquery) for MVP search.
-
-- **Object storage**: **S3** or S3-compatible (**AWS S3**, **MinIO** for local/dev, **Cloudflare R2**).  
-  - Document blobs (PDFs, images) and optionally preview assets.
-
-- **Vector DB**: See **§7** for recommendation and rationale.
-
-### 4.4 Real-time and jobs
-
-- **Pub/sub and queues**: **Redis** — pub/sub for collaboration, **BullMQ** for job queues (ingestion, embeddings, AI).
-- **WebSockets**: **@fastify/websocket** or **socket.io** with a Redis adapter when you run more than one API instance. See **§8** for why they’re needed and how they plug into the flow.
-
-### 4.5 Search
-
-- **MVP**: **PostgreSQL** full-text + **pg_trgm** for fuzzy match.  
-- **Later**: **Meilisearch** or **Typesense** for better search UX if needed.
-
-### 4.6 AI
-
-- **LLM**: HTTP client to **OpenAI**, **Anthropic**, or compatible APIs.  
-- **Embeddings**: Same providers (OpenAI/Anthropic embeddings APIs) from Node workers.  
-- **Orchestration**: BullMQ jobs that load context (annotations, doc chunks), call the LLM/embeddings API, then write results and citations as annotations.
-
-### 4.7 Observability and ops
-
-- **Logging**: Structured JSON (e.g. **pino**).
-- **Metrics**: **OpenTelemetry** or **prom-client** for latency and queue depth.
-- **Deployment**: One API process + one worker process for MVP; **Docker** (and **docker-compose**) for local and CI.
+- **MinIO** in development (S3-compatible, runs in Docker)
+- **AWS S3** or compatible (R2, etc.) in production
+- Frontend uploads/downloads directly via presigned URLs
 
 ---
 
-## 5. Component summary
+## 4. Key Data Flows
 
-| Component | Role | Key dependencies |
-|-----------|------|-------------------|
-| Auth & permissions | Identity, RBAC, token validation | PostgreSQL (or IdP), JWT/OAuth |
-| Document service | Upload, store, version, serve URLs | Object storage, PostgreSQL |
-| Annotation service | CRUD, threads, anchors, layers | PostgreSQL |
-| Collaboration service | Real-time events, presence | WebSockets, Redis pub/sub |
-| Search & graph service | Full-text, filters, vectors, link graph | PostgreSQL (FTS, pgvector optional), vector DB later |
-| Async / AI layer | Ingestion, embeddings, AI agents | Redis queue, object store, vector DB, LLM API |
-| API gateway | Routing, validation, errors | Fastify/FastAPI, auth middleware |
+### 4.1 Document Upload Flow
+
+```
+┌──────────┐  1. POST /upload         ┌──────────┐
+│  Client  │ ──────────────────────▶  │   API    │
+│          │  { filename, mimetype }  │          │
+│          │                          │          │
+│          │  ◀────────────────────── │          │
+│          │  2. { uploadUrl, s3Key } │          │
+│          │                          └──────────┘
+│          │
+│          │  3. PUT uploadUrl (file bytes)
+│          │ ──────────────────────────────────▶  S3
+│          │
+│          │  4. POST /documents
+│          │ ──────────────────────▶  ┌──────────┐
+│          │  { s3Key, title, ... }   │   API    │
+└──────────┘                          │          │
+                                      │  5. Create document (PENDING)
+                                      │  6. Queue processing job
+                                      └────┬─────┘
+                                           │
+                                           ▼
+                                      ┌──────────┐
+                                      │  Redis   │
+                                      │  Queue   │
+                                      └────┬─────┘
+                                           │
+                                           ▼
+                                      ┌──────────┐
+                                      │  Worker  │
+                                      │          │
+                                      │  7. Download from S3
+                                      │  8. Extract text
+                                      │  9. Queue embedding job
+                                      │  10. Update document (READY)
+                                      └──────────┘
+```
+
+### 4.2 Real-Time Annotation Flow
+
+```
+┌──────────┐  1. POST /annotations    ┌──────────┐
+│ Client A │ ──────────────────────▶  │   API    │
+│ (author) │                          │          │
+└──────────┘                          │  2. Write to DB
+                                      │  3. Publish to Redis
+                                      └────┬─────┘
+                                           │
+                                           ▼
+                                      ┌──────────┐
+                                      │  Redis   │
+                                      │  Pub/Sub │
+                                      └────┬─────┘
+                                           │
+                                           ▼
+                                      ┌──────────┐
+                                      │    WS    │
+                                      │  Server  │
+                                      │          │
+                                      │  4. Forward to room
+                                      └────┬─────┘
+                                           │
+                    ┌──────────────────────┼──────────────────────┐
+                    ▼                      ▼                      ▼
+              ┌──────────┐          ┌──────────┐          ┌──────────┐
+              │ Client B │          │ Client C │          │ Client D │
+              │ (viewer) │          │ (viewer) │          │ (viewer) │
+              │          │          │          │          │          │
+              │ 5. Update│          │ 5. Update│          │ 5. Update│
+              │    UI    │          │    UI    │          │    UI    │
+              └──────────┘          └──────────┘          └──────────┘
+```
+
+### 4.3 Download Flow
+
+```
+┌──────────┐  1. GET /documents       ┌──────────┐
+│  Client  │ ──────────────────────▶  │   API    │
+│          │                          │          │
+│          │  ◀────────────────────── │  2. Permission check
+│          │  [{ id, s3Key, ... }]    │     (owner OR member)
+│          │                          └──────────┘
+│          │
+│          │  3. GET /upload/download?s3Key=...
+│          │ ──────────────────────▶  ┌──────────┐
+│          │                          │   API    │
+│          │  ◀────────────────────── │          │
+│          │  4. { url: presignedUrl }│          │
+│          │                          └──────────┘
+│          │
+│          │  5. GET presignedUrl
+│          │ ──────────────────────────────────▶  S3
+│          │  ◀──────────────────────────────────
+│          │  6. File bytes
+└──────────┘
+```
 
 ---
 
-## 6. MVP deployment shape
+## 5. Annotation Anchoring (Hybrid Approach)
 
-For the MVP (auth, PDF upload/view, highlights + threaded comments, personal + group layers, basic AI explain/summarize, full-text search):
+Annotations use a hybrid anchor strategy depending on document type:
 
-- **One API process** that hosts all sync components and exposes HTTP + WebSocket.
-- **One Redis** instance for pub/sub and job queue.
-- **One PostgreSQL** instance for relational data and FTS.
-- **One object-storage** bucket (or MinIO in dev).
-- **One worker process** running ingestion + AI jobs (and later embedding jobs when you add semantic search).
+| Document Type | Primary Anchor | Secondary Data |
+|---------------|----------------|----------------|
+| PDF / Images | Coordinates (page, x, y, width, height as %) | Extracted/OCR text for search |
+| Code files | Line numbers (startLine, endLine) | Snippet for fuzzy re-matching |
+| Plain text | Character offsets + context | — |
 
-This keeps operations simple while preserving clear boundaries so you can extract services or add new workers as the product grows.
+Anchor schema (stored as JSON):
+
+```typescript
+// PDF / Image anchor
+{
+  type: "coords",
+  page: 1,
+  x: 10.5,      // % from left
+  y: 25.0,      // % from top
+  width: 30.0,  // % of page width
+  height: 2.5,  // % of page height
+  text?: {
+    selected: "highlighted text",
+    before: "context before...",
+    after: "...context after"
+  }
+}
+
+// Code anchor
+{
+  type: "code",
+  startLine: 42,
+  endLine: 50,
+  startCol: 0,
+  endCol: 80,
+  snippet: "function foo() { ... }"
+}
+
+// Text anchor
+{
+  type: "text",
+  startOffset: 1234,
+  endOffset: 1300,
+  selected: "selected text",
+  before: "context before...",
+  after: "...context after"
+}
+```
 
 ---
 
-## 7. Vector DB: what to use and why
+## 6. Database Schema Overview
 
-**Recommendation for this stack: pgvector (PostgreSQL extension).**
-
-| Option | Pros | Cons |
-|--------|------|------|
-| **pgvector** | Same DB as everything else; no new service; ACID; good Node support (`pgvector` npm). Adequate for “related annotations” and MVP semantic search. | Vector search scale and latency can lag dedicated vector DBs at very high dimensions or millions of rows. |
-| **Pinecone** | Managed, great DX, strong Node SDK. | Extra service and cost; another moving part for MVP. |
-| **Weaviate / Qdrant** | Open source, scalable, built for vectors. | New deployment and ops; more useful once you’re beyond single-DB limits. |
-
-**Why you need a vector store at all:** The spec calls for *semantic search* and *suggested related annotations/documents*. That means comparing *embeddings* (vectors), not just keywords. A vector DB (or PostgreSQL with pgvector) does approximate nearest-neighbour search over those vectors.
-
-**Practical path:** Use **pgvector** in your existing PostgreSQL instance for the MVP. Enable the extension, add an `embeddings` table (or columns) keyed by document/annotation id, and run embedding jobs that write into it. If you outgrow it (e.g. very large corpus or strict latency SLA), introduce Pinecone, Weaviate, or Qdrant and point the embedding pipeline and search API there.
+```
+┌─────────────────┐       ┌─────────────────┐       ┌─────────────────┐
+│      users      │       │    documents    │       │   annotations   │
+├─────────────────┤       ├─────────────────┤       ├─────────────────┤
+│ id visibleKey   │       │ id              │       │ id              │
+│ email           │◀──────│ ownerId (FK)    │──────▶│ documentId (FK) │
+│ passwordHash    │       │ title           │       │ userId (FK)     │
+│ name            │       │ type            │       │ type            │
+│ avatarUrl       │       │ mimeType        │       │ layer           │
+│ createdAt       │       │ size            │       │ anchor (JSON)   │
+│ updatedAt       │       │ s3Key           │       │ color           │
+└────────┬────────┘       │ textContent     │       │ content         │
+         │                │ processingStatus│       │ parentId (FK)   │
+         │                │ embedding       │       │ resolved        │
+         │                │ createdAt       │       │ metadata (JSON) │
+         │                │ updatedAt       │       │ createdAt       │
+         │                └────────┬────────┘       │ updatedAt       │
+         │                         │                └─────────────────┘
+         │                         │
+         │    ┌────────────────────┘
+         │    │
+         ▼    ▼
+┌─────────────────────┐
+│  document_members   │
+├─────────────────────┤
+│ id                  │
+│ documentId (FK)     │
+│ userId (FK)         │
+│ joinedAt            │
+│                     │
+│ @@unique(docId,     │
+│          userId)    │
+└─────────────────────┘
+```
 
 ---
 
-## 8. WebSockets: why they’re needed and how they fit in
+## 7. Why This Architecture
 
-**Why WebSockets:** The spec requires *real-time updates for annotations* and *&lt;200ms propagation*. When user A creates or edits an annotation, everyone else viewing that document should see it almost immediately. Polling over HTTP would be slow and wasteful; you need the server to *push* events to connected clients. WebSockets (or SSE) provide a long-lived channel for that.
-
-**How they integrate with the rest of the flow:**
-
-1. **Client** opens a WebSocket to the backend and sends a “join” message with `documentId` (and optionally `layer`). The server treats this as joining a *room* for that document/layer.
-2. **Annotation CRUD stays on HTTP.** The client creates/updates/deletes annotations via normal REST (e.g. `POST /documents/:id/annotations`). The API validates auth, writes to PostgreSQL, returns 201 + body.
-3. **Publish after write.** Right after a successful write, the same API process publishes an event to Redis (e.g. channel `doc:${documentId}`) with payload like `{ type: 'annotation.created', annotation }`.
-4. **WebSocket server subscribes to Redis.** The collaboration / WebSocket layer subscribes to those Redis channels. When it receives an event, it pushes the same payload to every WebSocket client in the matching room.
-5. **Clients** receive the event over the socket and update local state (e.g. add/update the annotation in the UI). No need to poll.
-
-So: **HTTP for all state changes** (single source of truth, easy to reason about); **WebSockets for broadcasting** those changes to other viewers. Auth is done once at WebSocket upgrade (e.g. via token in query or first message); room membership is enforced so users only get events for documents they’re allowed to see.
-
-**Multi-instance:** When you run more than one API server, each one subscribes to the same Redis channels. Every instance gets every event and can forward it to its own connected clients, so you get a single logical “bus” for real-time updates without tying clients to a specific server.
+| Decision | Reasoning |
+|----------|-----------|
+| **Monolith + Workers** | Simple to deploy, fast iteration for small team. Workers are separate processes but same codebase. Can extract to microservices later if needed. |
+| **Single Redis instance** | One Redis handles queues (BullMQ), pub/sub (real-time), and presence. Avoids premature complexity. Namespacing keeps concerns separate. |
+| **Async document processing** | Keeps API responses fast. Processing failures don't break document creation. Jobs are retryable. |
+| **Presigned URLs** | Frontend uploads directly to S3, offloading bandwidth from backend. Same pattern for downloads. |
+| **pgvector (not separate vector DB)** | Single database for relational data and vectors. Simpler ops, transactional consistency. Good enough for MVP scale. Migrate to dedicated vector DB only if needed. |
+| **WebSocket + Redis pub/sub** | Enables real-time updates across multiple API server instances. Redis acts as the message bus. |
+| **Hybrid anchors** | Coordinates work universally (even for scanned docs). Text/context stored when available for search and fuzzy re-anchoring. |
 
 ---
 
-## 9. Next steps / what to start with
+## 8. Processing Status Lifecycle
 
-Ordered so each step gives you something runnable and the next builds on it.
+```
+PENDING ──▶ PROCESSING ──▶ READY
+                │
+                ▼
+             FAILED
+```
 
-1. **Scaffold the backend**  
-   - Node + TypeScript + Fastify, folder layout (`src/routes`, `src/services`, `src/db`), env config (`DATABASE_URL`, `S3_*`, etc.), `npm run dev` and a health route.
+| Status | Meaning |
+|--------|---------|
+| PENDING | Document created, waiting for worker |
+| PROCESSING | Worker picked up the job |
+| READY | Text extracted, embedding generated |
+| FAILED | Processing error (see processingError field) |
 
-2. **PostgreSQL + schema**  
-   - Create DB, add migrations (e.g. with **Drizzle** or **Prisma**). Start with tables: `users`, `documents` (metadata only), `annotations`. Get the app connecting and performing a simple read.
+---
 
-3. **Auth**  
-   - Sign-up / login (e.g. email + password), issue JWT. Middleware that validates the token and attaches `user` to the request. Optionally plug in Supabase or Clerk to save implementation time.
+## 9. Security Considerations
 
-4. **Document service**  
-   - Wire S3 (or MinIO locally). Implement upload (presigned or server-side), store document metadata in `documents`, and an endpoint to get a download/preview URL. No viewer logic yet.
+| Concern | Mitigation |
+|---------|------------|
+| Auth | JWT tokens validated on every request via middleware |
+| Document access | Permission check: user must be owner OR member |
+| S3 key as capability | Only returned to authorized users; presigned URLs expire |
+| User input | Validate with Zod; sanitize before DB writes |
+| Secrets | Environment variables, not in code |
 
-5. **Annotation service**  
-   - CRUD for annotations scoped to a document and user; support at least highlight and comment, plus layers (e.g. `personal` / `group`). This is the core of the product.
+---
 
-6. **Real-time (WebSockets + Redis)**  
-   - Add Redis, WebSocket endpoint, and “join document room” semantics. On each annotation create/update/delete, publish to Redis and push to clients in that room. Verify updates appear in a second browser/tab without refresh.
+## 10. Deployment Shape (MVP)
 
-7. **Search**  
-   - PostgreSQL full-text on documents and annotations, plus basic filters (by user, layer, doc). Expose via a `GET /search` (or similar) endpoint.
+For the MVP, deploy as:
 
-8. **Workers + AI**  
-   - BullMQ queue, worker process, and one job type (e.g. “summarize selection”). Worker calls the LLM, then writes the result as an annotation and links it to the source. Ensure failures don’t break annotation persistence.
+- **1 API process** — Express server (can run multiple behind load balancer)
+- **1 Worker process** — BullMQ workers for document processing and embeddings
+- **1 Redis instance** — Queues + pub/sub + presence
+- **1 PostgreSQL instance** — All relational data + pgvector
+- **1 S3 bucket** — Document storage (or MinIO for local dev)
 
-9. **Vector DB + semantic search (later)**  
-   - Enable pgvector, add embedding storage, run embedding jobs from ingestion or annotation changes. Add a “semantic search” or “related annotations” API that queries by vector. This can follow once the above is stable.
+All components can run in Docker via docker-compose for local development.
+
+---
+
+## 11. Future Considerations
+
+| When | Consider |
+|------|----------|
+| High worker load | Scale workers horizontally (add more processes) |
+| Vector search at scale | Migrate to dedicated vector DB (Pinecone, Qdrant, Weaviate) |
+| Team growth | Extract services along clear boundaries (e.g., separate auth service) |
+| Global users | CDN for S3, consider edge deployment for API |
+| Complex permissions | Add roles to DocumentMember (VIEWER, COMMENTER, EDITOR) |
+
+---
+
+## 12. Current Implementation Status
+
+| Component | Status |
+|-----------|--------|
+| Project scaffold | ✓ Done |
+| Docker-compose (Postgres, Redis, MinIO) | ✓ Done |
+| Prisma schema | ✓ Done |
+| Auth (signup, login, JWT middleware) | ✓ Done |
+| User service + routes | ✓ Done |
+| Upload service (presigned URLs) | ✓ Done |
+| Document service + routes | ✓ Done |
+| Annotation service + routes | Pending |
+| WebSocket server | Pending |
+| Workers (document processing, embeddings) | Pending |
+| Search (full-text, semantic) | Pending |
