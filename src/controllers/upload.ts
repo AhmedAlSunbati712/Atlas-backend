@@ -6,8 +6,11 @@ const getUploadUrl = async (req: Request & { userId: string }, res: Response) =>
         if (!req.userId) {
             return res.status(401).json({ error: "Unauthorized" });
         }
-        const data = req.body;
-        const uploadUrl = await uploadService.getUploadUrl(data);
+        const { filename, mimetype, size } = req.body;
+        if (!filename || !mimetype || !size) {
+            return res.status(400).json({ error: "Missing filename, mimetype, or size" });
+        }
+        const uploadUrl = await uploadService.getUploadUrl({ userId: req.userId, filename, mimetype, size });
         res.status(200).json(uploadUrl);
     } catch (error) {
         console.error("Error getting upload URL:", error);
@@ -20,9 +23,12 @@ const getDownloadUrl = async (req: Request & { userId: string }, res: Response) 
         if (!req.userId) {
             return res.status(401).json({ error: "Unauthorized" });
         }
-        const data = req.body;
+        const data = req.query.s3Key as string;
+        if (!data) {
+            return res.status(400).json({ error: "Missing s3Key" });
+        }
         const downloadUrl = await uploadService.getDownloadUrl(data);
-        res.status(200).json(downloadUrl);
+        res.status(200).json({ url: downloadUrl });
     } catch (error) {
         console.error("Error getting download URL:", error);
         res.status(500).json({ error: "Failed to get download URL" });
