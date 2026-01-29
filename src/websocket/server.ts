@@ -16,13 +16,15 @@ const subscriber = subsrciber.duplicate();
     await subscriber.connect();
 })();
 subscriber.psubscribe("doc:*");
-subscriber.on("pmessage", (pattern, channel, message) => {
+subscriber.on("pmessage", (_pattern, channel, message) => {
     const data = JSON.parse(message.toString());
     const userId = data.userId;
+    const roomId = channel.toString();
+    const room = roomMap.get(roomId);
 
     if (data.type === "presence.joined") {
-        const roomId = channel.toString();
-        const room = roomMap.get(roomId);
+        
+        
         for (let ws of room || []) {
             if (ws.userId !== userId) {
                 ws.send(JSON.stringify({
@@ -30,6 +32,25 @@ subscriber.on("pmessage", (pattern, channel, message) => {
                     userId,
                 }));
             }
+        }
+    } else if (data.type === "presence.left") {
+        for (let ws of room || []) {
+            ws.send(JSON.stringify({
+                type: "presence.left",
+                userId,
+            }));
+        }
+    } else  if (data.type === "presence.annotation") {
+        const annotation = data.annotation;
+        for (let ws of room || []) {
+            if (ws.userId != userId) {
+                ws.send(JSON.stringify({
+                    type: "presence.annotation",
+                    annotation,
+                    userId,
+                }));
+            }
+
         }
     }
     
@@ -42,12 +63,13 @@ wss.on("connection", async(ws: WebSocket, req) => {
 
     if (!docId || !userId) {
         ws.close();
+        return;
     }
     // Check if the user has access to the document
     const userDocuments = await prisma.document.findMany({
         where: {
-            ownerId: userId!,
-            OR: [
+            OR: [   
+                { ownerId: userId! },
                 { members: { some: { userId: userId! } } },
             ]
         }
