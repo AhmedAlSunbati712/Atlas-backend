@@ -28,9 +28,9 @@ This document describes the finalized architecture for the Atlas collaborative a
 │   └───────┼──────────────────────────────────────────┼──────────────────┘   │
 │           │                                          │                      │
 │   ┌───────┼──────────────────────────────────────────┼──────────────────┐   │
-│   │       │           WebSocket Server               │                  │   │
+│   │       │     WebSocket Server (same port /ws)     │                  │   │
 │   │       │  ┌─────────────────────────────────┐     │                  │   │
-│   │       │  │  Room Management + Presence     │     │                  │   │
+│   │       │  │  Room Management (in-memory Map)│     │                  │   │
 │   │       │  └─────────────────────────────────┘     │                  │   │
 │   │       │         │              ▲                 │                  │   │
 │   │       │         │   Subscribe  │  Publish        │                  │   │
@@ -40,11 +40,11 @@ This document describes the finalized architecture for the Atlas collaborative a
 │           ▼         ▼              │                 ▼                      │
 │   ┌─────────────────────────────────────────────────────────────────────┐   │
 │   │                              Redis                                  │   │
-│   │  ┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐     │   │
-│   │  │  BullMQ Queues  │  │    Pub/Sub      │  │    Presence     │     │   │
-│   │  │  - doc-process  │  │  - doc:{id}     │  │  - room keys    │     │   │
-│   │  │  - embedding    │  │                 │  │    with TTL     │     │   │
-│   │  └─────────────────┘  └─────────────────┘  └─────────────────┘     │   │
+│   │  ┌─────────────────┐  ┌─────────────────┐                          │   │
+│   │  │  BullMQ Queues  │  │    Pub/Sub      │                          │   │
+│   │  │  - doc-process  │  │  - doc:{id}     │                          │   │
+│   │  │  - embedding    │  │  (multi-server) │                          │   │
+│   │  └─────────────────┘  └─────────────────┘                          │   │
 │   └───────────────────────────────────┬─────────────────────────────────┘   │
 │                                       │                                     │
 │   ┌───────────────────────────────────┼─────────────────────────────────┐   │
@@ -92,7 +92,7 @@ This document describes the finalized architecture for the Atlas collaborative a
 | Object Storage | S3 / MinIO (local dev) |
 | Cache + Queue + Pub/Sub | Redis (single instance) |
 | Job Queue | BullMQ |
-| WebSockets | express-ws or ws |
+| WebSockets | ws (shares HTTP server) |
 | Auth | JWT (jsonwebtoken) |
 | Embeddings | OpenAI text-embedding-3-small |
 | PDF Parsing | pdf-parse or pdfjs-dist |
@@ -115,24 +115,28 @@ The main HTTP server handling all REST endpoints.
 
 ### 3.2 WebSocket Server
 
-Handles real-time collaboration features.
+Handles real-time collaboration for **group layer annotations only**.
 
-| Feature | How it works |
-|---------|--------------|
-| **Room management** | Clients join rooms by documentId; server tracks connections per room |
-| **Event broadcasting** | Subscribes to Redis pub/sub; forwards events to clients in matching rooms |
-| **Presence** | Tracks who is viewing each document; broadcasts cursor positions |
+| Aspect | Details |
+|--------|---------|
+| **Port** | Same as Express (shares the HTTP server via `/ws` path) |
+| **Room tracking** | In-memory `Map<docId, Map<userId, WebSocket>>` |
+| **When used** | Only when user is viewing group layer annotations |
+| **Presence** | Tracked via WebSocket connections (connected = present, disconnected = gone) |
+
+**Note:** Personal layer annotations don't need WebSockets — use regular HTTP (react-query/axios).
 
 ### 3.3 Redis
 
-Single Redis instance serving multiple purposes via namespacing:
+Single Redis instance serving two main purposes:
 
 | Purpose | Redis Feature | Key Pattern |
 |---------|---------------|-------------|
 | Document processing queue | BullMQ | `bull:document-processing:*` |
 | Embedding generation queue | BullMQ | `bull:embedding:*` |
-| Real-time events | Pub/Sub | Channels: `doc:{documentId}` |
-| Presence tracking | Key-Value + TTL | `presence:{documentId}:{userId}` |
+| Real-time events (multi-server) | Pub/Sub | Channels: `doc:{documentId}` |
+
+**Note on Pub/Sub:** Redis pub/sub is only needed when running **multiple API server instances**. For a single server, the in-memory room Map is sufficient. We include pub/sub for future scalability.
 
 ### 3.4 Workers
 
@@ -164,9 +168,85 @@ Object storage for document files (PDFs, images, code files).
 
 ---
 
-## 4. Key Data Flows
+## 4. WebSocket: When and How
 
-### 4.1 Document Upload Flow
+### 4.1 When to use WebSocket
+
+| Annotation Layer | Transport | Why |
+|------------------|-----------|-----|
+| **Personal** | HTTP only (axios/react-query) | Only you can see them. No real-time sync needed. |
+| **Group** | HTTP + WebSocket | Others can add/edit. Need real-time updates. |
+
+### 4.2 WebSocket Connection Flow
+
+```
+┌──────────┐                                    ┌──────────────────────────┐
+│ Frontend │                                    │  Backend (Express + WS)  │
+└────┬─────┘                                    └────────────┬─────────────┘
+     │                                                       │
+     │  1. User toggles to group layer                       │
+     │                                                       │
+     │  2. new WebSocket("ws://localhost:3000/ws")          │
+     │ ─────────────────────────────────────────────────────▶│
+     │     HTTP Upgrade request                              │
+     │                                                       │
+     │  ◀───────────────────────────────────────────────────│
+     │     101 Switching Protocols                           │
+     │                                                       │
+     │  3. ws.send({ action: "join", documentId, userId })  │
+     │ ─────────────────────────────────────────────────────▶│
+     │                                                       │  4. Add to room Map
+     │                                                       │
+     │  ... connection stays open ...                        │
+     │                                                       │
+     │  5. Another user creates annotation (HTTP POST)       │
+     │                                                       │  6. API writes to DB
+     │                                                       │  7. API publishes to Redis
+     │                                                       │     (or directly to room if single server)
+     │                                                       │
+     │  ◀───────────────────────────────────────────────────│  8. WS server forwards
+     │     { type: "annotation.created", annotation }        │
+     │                                                       │
+     │  9. Frontend updates UI                               │
+     │                                                       │
+     │  10. User toggles back to personal layer              │
+     │                                                       │
+     │  ws.close()                                           │
+     │ ─────────────────────────────────────────────────────▶│  11. Remove from room Map
+     │                                                       │
+```
+
+### 4.4 Presence Tracking
+
+Presence is tracked **via WebSocket connections**, not Redis keys:
+
+| Event | Action |
+|-------|--------|
+| Client connects + joins room | They're present (in the room Map) |
+| Client disconnects | They're gone (removed from Map) |
+| Get who's in a room | Iterate the Map for that docId |
+
+To notify others of presence changes, publish events via the same pub/sub channel:
+
+```typescript
+// On join
+redis.publish(`doc:${docId}`, JSON.stringify({
+  type: 'presence.joined',
+  user: { id: userId, name: userName }
+}));
+
+// On leave
+redis.publish(`doc:${docId}`, JSON.stringify({
+  type: 'presence.left',
+  userId
+}));
+```
+
+---
+
+## 5. Key Data Flows
+
+### 5.1 Document Upload Flow
 
 ```
 ┌──────────┐  1. POST /upload         ┌──────────┐
@@ -205,14 +285,14 @@ Object storage for document files (PDFs, images, code files).
                                       └──────────┘
 ```
 
-### 4.2 Real-Time Annotation Flow
+### 5.2 Real-Time Annotation Flow (Group Layer)
 
 ```
 ┌──────────┐  1. POST /annotations    ┌──────────┐
 │ Client A │ ──────────────────────▶  │   API    │
 │ (author) │                          │          │
 └──────────┘                          │  2. Write to DB
-                                      │  3. Publish to Redis
+                                      │  3. Publish to Redis (or room Map)
                                       └────┬─────┘
                                            │
                                            ▼
@@ -240,7 +320,7 @@ Object storage for document files (PDFs, images, code files).
               └──────────┘          └──────────┘          └──────────┘
 ```
 
-### 4.3 Download Flow
+### 5.3 Download Flow
 
 ```
 ┌──────────┐  1. GET /documents       ┌──────────┐
@@ -266,7 +346,7 @@ Object storage for document files (PDFs, images, code files).
 
 ---
 
-## 5. Annotation Anchoring (Hybrid Approach)
+## 6. Annotation Anchoring (Hybrid Approach)
 
 Annotations use a hybrid anchor strategy depending on document type:
 
@@ -317,13 +397,13 @@ Anchor schema (stored as JSON):
 
 ---
 
-## 6. Database Schema Overview
+## 7. Database Schema Overview
 
 ```
 ┌─────────────────┐       ┌─────────────────┐       ┌─────────────────┐
 │      users      │       │    documents    │       │   annotations   │
 ├─────────────────┤       ├─────────────────┤       ├─────────────────┤
-│ id visibleKey   │       │ id              │       │ id              │
+│ id              │       │ id              │       │ id              │
 │ email           │◀──────│ ownerId (FK)    │──────▶│ documentId (FK) │
 │ passwordHash    │       │ title           │       │ userId (FK)     │
 │ name            │       │ type            │       │ type            │
@@ -356,21 +436,23 @@ Anchor schema (stored as JSON):
 
 ---
 
-## 7. Why This Architecture
+## 8. Why This Architecture
 
 | Decision | Reasoning |
 |----------|-----------|
 | **Monolith + Workers** | Simple to deploy, fast iteration for small team. Workers are separate processes but same codebase. Can extract to microservices later if needed. |
-| **Single Redis instance** | One Redis handles queues (BullMQ), pub/sub (real-time), and presence. Avoids premature complexity. Namespacing keeps concerns separate. |
+| **Single Redis instance** | One Redis handles queues (BullMQ) and pub/sub (real-time). Avoids premature complexity. |
+| **WebSocket only for group layer** | Personal annotations don't need real-time. Reduces complexity and connections. |
+| **Presence via connections** | No Redis keys/TTL needed. WebSocket connection = present. Simpler than explicit presence tracking. |
+| **Redis pub/sub optional for MVP** | Only needed for multi-server. Single server can use in-memory room Map directly. |
 | **Async document processing** | Keeps API responses fast. Processing failures don't break document creation. Jobs are retryable. |
 | **Presigned URLs** | Frontend uploads directly to S3, offloading bandwidth from backend. Same pattern for downloads. |
-| **pgvector (not separate vector DB)** | Single database for relational data and vectors. Simpler ops, transactional consistency. Good enough for MVP scale. Migrate to dedicated vector DB only if needed. |
-| **WebSocket + Redis pub/sub** | Enables real-time updates across multiple API server instances. Redis acts as the message bus. |
+| **pgvector (not separate vector DB)** | Single database for relational data and vectors. Simpler ops, transactional consistency. Good enough for MVP scale. |
 | **Hybrid anchors** | Coordinates work universally (even for scanned docs). Text/context stored when available for search and fuzzy re-anchoring. |
 
 ---
 
-## 8. Processing Status Lifecycle
+## 9. Processing Status Lifecycle
 
 ```
 PENDING ──▶ PROCESSING ──▶ READY
@@ -388,7 +470,7 @@ PENDING ──▶ PROCESSING ──▶ READY
 
 ---
 
-## 9. Security Considerations
+## 10. Security Considerations
 
 | Concern | Mitigation |
 |---------|------------|
@@ -400,25 +482,28 @@ PENDING ──▶ PROCESSING ──▶ READY
 
 ---
 
-## 10. Deployment Shape (MVP)
+## 11. Deployment Shape (MVP)
 
 For the MVP, deploy as:
 
-- **1 API process** — Express server (can run multiple behind load balancer)
+- **1 API process** — Express server + WebSocket server (same port)
 - **1 Worker process** — BullMQ workers for document processing and embeddings
-- **1 Redis instance** — Queues + pub/sub + presence
+- **1 Redis instance** — Queues + pub/sub (pub/sub optional for single server)
 - **1 PostgreSQL instance** — All relational data + pgvector
 - **1 S3 bucket** — Document storage (or MinIO for local dev)
 
 All components can run in Docker via docker-compose for local development.
 
+**Scaling note:** When you need multiple API servers, Redis pub/sub becomes essential for broadcasting events across instances.
+
 ---
 
-## 11. Future Considerations
+## 12. Future Considerations
 
 | When | Consider |
 |------|----------|
 | High worker load | Scale workers horizontally (add more processes) |
+| Multiple API servers | Enable Redis pub/sub for cross-instance real-time |
 | Vector search at scale | Migrate to dedicated vector DB (Pinecone, Qdrant, Weaviate) |
 | Team growth | Extract services along clear boundaries (e.g., separate auth service) |
 | Global users | CDN for S3, consider edge deployment for API |
@@ -426,7 +511,7 @@ All components can run in Docker via docker-compose for local development.
 
 ---
 
-## 12. Current Implementation Status
+## 13. Current Implementation Status
 
 | Component | Status |
 |-----------|--------|

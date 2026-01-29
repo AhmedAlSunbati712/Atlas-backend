@@ -14,7 +14,7 @@ datasource db {
 // ============================================================================
 
 model User {
-  id           String   @id @default(cuid())
+  id           String   @id @default(uuid())
   email        String   @unique
   passwordHash String   @map("password_hash")
   name         String?
@@ -42,11 +42,18 @@ enum DocumentType {
   MARKDOWN
 }
 
+enum DocumentStatus {
+  PENDING
+  PROCESSING
+  SUCCESS
+  FAILED
+}
 model Document {
-  id          String       @id @default(cuid())
+  id          String       @id @default(uuid())
   ownerId     String       @map("owner_id")
   title       String
   type        DocumentType
+  status      DocumentStatus
   mimeType    String       @map("mime_type")
   size        Int // bytes
   s3Key       String       @map("s3_key")
@@ -71,7 +78,7 @@ model Document {
 
 // Join table for users who have access to a document
 model DocumentMember {
-  id         String   @id @default(cuid())
+  id         String   @id @default(uuid())
   documentId String   @map("document_id")
   userId     String   @map("user_id")
   joinedAt   DateTime @default(now()) @map("joined_at")
@@ -105,7 +112,7 @@ enum AnnotationLayer {
 }
 
 model Annotation {
-  id         String          @id @default(cuid())
+  id         String          @id @default(uuid())
   documentId String          @map("document_id")
   userId     String          @map("user_id")
   type       AnnotationType
